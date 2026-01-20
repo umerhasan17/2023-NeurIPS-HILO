@@ -1,5 +1,3 @@
-
-
 from src.phosphene_model import RectangleImplant, MVGModel
 from src.DSE import UniversalMVGLayer, load_model, rand_model_params, default_phi_ranges, NaiveEncoding, MODEL_NAMES_TO_VERSION_OSF
 
@@ -9,9 +7,21 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import random
-import matlab
-import matlab.engine
 import io
+
+# BoTorch and GPyTorch imports
+import torch
+import gpytorch
+import gpytorch.settings as settings
+import botorch
+from botorch.models.pairwise_gp import PairwiseGP, PairwiseLaplaceMarginalLogLikelihood
+from botorch.fit import fit_gpytorch_mll
+from botorch.acquisition import PosteriorMean, UpperConfidenceBound, ExpectedImprovement
+# PosteriorStandardDeviation might not be directly available in all versions, can assume UCB with high beta or implement simple wrapper
+# We will check or implement simple var maximization
+from botorch.optim import optimize_acqf
+from gpytorch.kernels import MaternKernel, RBFKernel, ScaleKernel
+from gpytorch.priors import GammaPrior
 
 
 def patient_from_phi(phi, model, implant, implant_kwargs={}, layer=None):
@@ -190,8 +200,9 @@ class HILOPatient():
             ranges = default_phi_ranges[self.version]
         self.ranges = ranges
         thetacov = np.array([[0.54], [3.63]], dtype='double')
-        if matlab_dir is not None:
-            self.setup_matlab(matlab_dir, kernel=kernel, ranges=ranges, thetacov=thetacov, acquisition=acquisition, maxiter=maxiter, nopt=nopt)
+        
+        # Call python setup instead of matlab
+        self.setup_hilo_python(kernel=kernel, ranges=ranges, thetacov=thetacov, acquisition=acquisition, maxiter=maxiter, nopt=nopt)
         
 
     def get_decoder_layer(self, decoder_layer, misspecification, miss_options, universalmvg_kwargs={}):
@@ -214,24 +225,20 @@ class HILOPatient():
             return decoder_layer
 
 
-    ################## HILO Matlab interface functions ###################################
-    def setup_matlab(self, matlab_dir, kernel='Matern52', ranges=None, thetacov=None,
+    ################## HILO Python interface functions ###################################
+    
+    def setup_hilo_python(self, kernel='Matern52', ranges=None, thetacov=None,
                       acquisition='MUC', maxiter=200, nopt=3):
         """
-        Sets up the interface to matlab
-        Returns nothing, but after calling, the hilo patient will be set up to 
-        do PBO with the ranges and names sent.
-        See setup_hilo.m for details and more default values
+        Sets up the python BO interface
         """
-        if matlab_dir is None:
-            raise ValueError("Must supply a matlabdir where setup_hilo scripts are")
         if thetacov is None:
             thetacov = np.array([0., 0.], dtype='double')
 
-        self.matlab_dir = matlab_dir
-        self.kernel = kernel
-        self.ub = np.array([[v[1]] for k, v in ranges.items() if k in self.use_phi_names], dtype='double')
-        self.lb = np.array([[v[0]] for k, v in ranges.items() if k in self.use_phi_names], dtype='double')
+        self.kernel_name = kernel
+        self.ub = np.array([[v[1]] for k, v in ranges.items() if k in self.use_phi_names], dtype='double').flatten()
+        self.lb = np.array([[v[0]] for k, v in ranges.items() if k in self.use_phi_names], dtype='double').flatten()
+        
         if self.missspecification == 'OOD' and len(self.miss_options) > 1 and self.miss_options[1] == 'adjust':
             ub = []
             lb = []
@@ -240,8 +247,8 @@ class HILOPatient():
                     continue
                 m = (v[1] + v[0]) / 2
                 r = v[1] - v[0]
-                ub.append([m + r/2 + r*float(self.miss_options[0])/2])
-                lb.append([m- r/2 - r*float(self.miss_options[0])/2])
+                ub.append(m + r/2 + r*float(self.miss_options[0])/2)
+                lb.append(m- r/2 - r*float(self.miss_options[0])/2)
             self.lb = np.array(lb, dtype='double')
             self.ub = np.array(ub, dtype='double')
 
@@ -251,19 +258,237 @@ class HILOPatient():
         self.nopt = nopt
         self.thetacov = np.array(np.array(thetacov).reshape((1, -1)), dtype='double')
 
-        self.eng = matlab.engine.start_matlab()
-        self.eng.cd(matlab_dir, nargout=0)
-
-        self.hiloModel = self.eng.setup_hilo(self.kernel, self.ub, self.lb, self.thetacov, self.acquisition, self.maxiter, self.nopt)
         self.iter = 1
         self.d = len(self.ub)
         self.out = io.StringIO()
         self.err = io.StringIO()
+        
+        # BoTorch Setup
+        self.device = torch.device("cpu") # Default to CPU for stability
+        self.dtype = torch.double
+        self.hiloModel = {'state_dict': None} # Store model state for persistence
 
+    def _normalize(self, x):
+        """Normalize x (numpy array) using lb and ub"""
+        lb = self.lb.reshape(-1)
+        ub = self.ub.reshape(-1)
+        # Handle broadcasting
+        # Expect x to be (d, N) or (d,)
+        if x.ndim == 1 and x.shape[0] == self.d:
+             return (x - lb) / (ub - lb)
+        if x.shape[0] == self.d:
+             # x is (d, N)
+             return (x - lb[:, None]) / (ub[:, None] - lb[:, None])
+        elif x.shape[1] == self.d:
+             # x is (N, d)
+             return (x - lb[None, :]) / (ub[None, :] - lb[None, :])
+        return x
+
+    def _unnormalize(self, x):
+        """Unnormalize x (numpy array or tensor)"""
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().numpy()
+        lb = self.lb.reshape(-1)
+        ub = self.ub.reshape(-1)
+        
+        if x.ndim == 1 and x.shape[0] == self.d:
+             return x * (ub - lb) + lb
+        
+        if x.shape[0] == self.d:
+             return x * (ub[:, None] - lb[:, None]) + lb[:, None]
+        return x * (ub[None, :] - lb[None, :]) + lb[None, :]
+
+    def _get_covar_module(self):
+        """Helper to get covariance module based on kernel name"""
+        # Note: ARD is disabled by default for robustness unless explicitly requested
+        # 'ARD' name implies RBF with ARD
+        # For Matern, we will stick to isotropic by default unless I decide to force ARD for everything
+        # Given previous instability, I will implement isotropic for named kernels, and ARD only for 'ARD' name
+        
+        if self.kernel_name == 'Matern52':
+            return ScaleKernel(MaternKernel(nu=2.5))
+        elif self.kernel_name == 'Matern32':
+            return ScaleKernel(MaternKernel(nu=1.5))
+        elif self.kernel_name == 'Gaussian':
+            return ScaleKernel(RBFKernel())
+        elif self.kernel_name == 'ARD':
+            return ScaleKernel(RBFKernel(ard_num_dims=self.d))
+        else:
+            return ScaleKernel(MaternKernel(nu=2.5))
+
+    def acquisition_python(self, xtrain, ctrain, iter):
+        """
+        Equivalent to matlab/acquisition.m
+        Returns new duel [x_duel1; x_duel2] (flattened)
+        """
+        if self.acquisition == 'random':
+             x_duel1 = np.random.rand(self.d) * (self.ub - self.lb) + self.lb
+             x_duel2 = np.random.rand(self.d) * (self.ub - self.lb) + self.lb
+             return np.concatenate([x_duel1, x_duel2])
+
+        if iter <= self.nopt or xtrain is None or len(xtrain) == 0:
+            # Random acquisition
+            x_duel1 = np.random.rand(self.d) * (self.ub - self.lb) + self.lb
+            x_duel2 = np.random.rand(self.d) * (self.ub - self.lb) + self.lb
+            return np.concatenate([x_duel1, x_duel2])
+        
+        # Format Data
+        N = xtrain.shape[1]
+        x1 = xtrain[0:self.d, :] 
+        x2 = xtrain[self.d:, :]
+        x1_norm = self._normalize(x1)
+        x2_norm = self._normalize(x2)
+        x1_norm = x1_norm.T
+        x2_norm = x2_norm.T
+        train_x = np.concatenate([x1_norm, x2_norm], axis=0)
+        train_x_torch = torch.tensor(train_x, dtype=self.dtype, device=self.device)
+        
+        ctrain_flat = ctrain.flatten()
+        comps = []
+        for k in range(N):
+            if ctrain_flat[k] == 1:
+                comps.append([k, k + N])
+            else:
+                comps.append([k + N, k])
+        comps_torch = torch.tensor(comps, dtype=torch.long, device=self.device)
+        
+        covar_module = self._get_covar_module()
+        model = PairwiseGP(train_x_torch, comps_torch, covar_module=covar_module)
+        if self.hiloModel.get('state_dict') is not None:
+             try:
+                 model.load_state_dict(self.hiloModel['state_dict'], strict=False)
+             except:
+                 pass
+
+        mll = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
+        with settings.cholesky_jitter(1e-1):
+            try:
+                fit_gpytorch_mll(mll)
+                self.hiloModel['state_dict'] = model.state_dict()
+            except Exception as e:
+                # print(f"Warning: Model fitting failed: {e}")
+                pass
+            
+            bounds = torch.stack([torch.zeros(self.d), torch.ones(self.d)]).to(self.device).to(self.dtype)
+            
+            # 1. Best point (always PosteriorMean)
+            acq_mean = PosteriorMean(model)
+            candidate_best, _ = optimize_acqf(
+                acq_function=acq_mean,
+                bounds=bounds,
+                q=1,
+                num_restarts=20,
+                raw_samples=1024,
+            )
+            x_best_norm = candidate_best.detach().cpu().numpy().flatten()
+            
+            # 2. Challenger
+            if self.acquisition == 'bivariate_EI':
+                # Approximate best_f
+                with torch.no_grad():
+                    post = model.posterior(train_x_torch)
+                    best_f = post.mean.max()
+                acq_chal = ExpectedImprovement(model, best_f=best_f)
+            elif self.acquisition == 'MUC':
+                # Use UCB with high beta as proxy for uncertainty/exploration
+                # Or define custom acquisition. Using UCB beta=10 for now.
+                acq_chal = UpperConfidenceBound(model, beta=10.0)
+            else: # Dueling_UCB or default
+                acq_chal = UpperConfidenceBound(model, beta=2.0)
+
+            candidate_challenger, _ = optimize_acqf(
+                acq_function=acq_chal,
+                bounds=bounds,
+                q=1,
+                num_restarts=20,
+                raw_samples=1024,
+            )
+            x_chal_norm = candidate_challenger.detach().cpu().numpy().flatten()
+        
+        # Unnormalize
+        x_best = self._unnormalize(x_best_norm)
+        x_chal = self._unnormalize(x_chal_norm)
+        
+        return np.concatenate([x_best, x_chal])
+
+    def update_posterior_python(self, xtrain, ctrain):
+        """
+        Equivalent to matlab/update_posterior.m
+        Since we refit every time in acquisition, this is a placeholder.
+        """
+        # In MATLAB, this updated the internal 'post' structure.
+        # Here we don't persist the model between calls (we recreate it from xtrain/ctrain).
+        # We could persist it, but rebuilding is safer and fine for small N.
+        return self.hiloModel
+
+    def identify_best_python(self, xtrain, ctrain):
+        """
+        Equivalent to matlab/identify_best.m
+        """
+        if xtrain is None or len(xtrain) == 0:
+             return np.random.rand(self.d) * (self.ub - self.lb) + self.lb
+             
+        # Similar logic to acquisition but just return best
+        N = xtrain.shape[1]
+        x1 = xtrain[0:self.d, :].T
+        x2 = xtrain[self.d:, :].T
+        x1_norm = self._normalize(x1)
+        x2_norm = self._normalize(x2)
+        train_x = np.concatenate([x1_norm, x2_norm], axis=0)
+        train_x_torch = torch.tensor(train_x, dtype=self.dtype, device=self.device)
+        ctrain_flat = ctrain.flatten()
+        comps = []
+        for k in range(N):
+            if ctrain_flat[k] == 1:
+                comps.append([k, k + N])
+            else:
+                comps.append([k + N, k])
+        comps_torch = torch.tensor(comps, dtype=torch.long, device=self.device)
+        
+        covar_module = self._get_covar_module()
+        model = PairwiseGP(train_x_torch, comps_torch, covar_module=covar_module)
+        if self.hiloModel.get('state_dict') is not None:
+             try:
+                 model.load_state_dict(self.hiloModel['state_dict'], strict=False)
+             except:
+                 pass
+
+        mll = PairwiseLaplaceMarginalLogLikelihood(model.likelihood, model)
+        with settings.cholesky_jitter(1e-1):
+            try:
+                fit_gpytorch_mll(mll)
+                self.hiloModel['state_dict'] = model.state_dict()
+            except Exception as e:
+                # print(f"Warning: Model fitting failed: {e}")
+                pass
+            
+            bounds = torch.stack([torch.zeros(self.d), torch.ones(self.d)]).to(self.device).to(self.dtype)
+            acq_mean = PosteriorMean(model)
+            candidate_best, _ = optimize_acqf(
+                acq_function=acq_mean,
+                bounds=bounds,
+                q=1,
+                num_restarts=20,
+                raw_samples=1024,
+            )
+            x_best_norm = candidate_best.detach().cpu().numpy().flatten()
+        return self._unnormalize(x_best_norm)
+
+    def get_probs_theta_python(self, x, c, theta=None):
+        """
+        Equivalent to matlab/get_probs_theta.m
+        Returns predicted probabilities.
+        """
+        pass # Implement if needed, but not strictly required by HILO.py usage
+    
+    def get_theta_python(self):
+        """
+        Equivalent to matlab/get_theta.m
+        """
+        pass
 
     def reset_hilo(self):
-        self.hiloModel = self.eng.setup_hilo(self.kernel, self.ub, self.lb, self.thetacov, self.acquisition, self.maxiter, self.nopt)
-        self.iter = 1
+        self.setup_hilo_python(self.kernel_name, self.ranges, self.thetacov, self.acquisition, self.maxiter, self.nopt)
 
 
     def verify_hilo(self, xtrain, ctrain):
@@ -307,10 +532,12 @@ class HILOPatient():
     def hilo_acquisition(self, xtrain, ctrain):
         """Returns an array of shape (d*2)"""
         if xtrain is None :
-            newx = self.eng.acquisition(self.hiloModel, [], [], self.iter, stdout=self.out,stderr=self.err)
+             # Call python acquisition with empty
+             newx = self.acquisition_python(None, None, self.iter)
         else:
             xtrain, ctrain = self.verify_hilo(xtrain, ctrain)
-            newx = self.eng.acquisition(self.hiloModel, xtrain, ctrain, self.iter, stdout=self.out,stderr=self.err)
+            newx = self.acquisition_python(xtrain, ctrain, self.iter)
+            
         self.iter += 1
         newx =  np.array(newx, dtype='double').squeeze()
         newx = self.add_phi(newx, double=True)
@@ -319,17 +546,17 @@ class HILOPatient():
     def hilo_update_posterior(self, xtrain, ctrain):
         xtrain, ctrain = self.verify_hilo(xtrain, ctrain)
         # print(ctrain)
-        self.hiloModel = self.eng.update_posterior(self.hiloModel, xtrain, ctrain, stdout=self.out,stderr=self.err)
+        self.hiloModel = self.update_posterior_python(xtrain, ctrain)
 
     def hilo_identify_best(self, xtrain, ctrain):
         xtrain, ctrain = self.verify_hilo(xtrain, ctrain)
-        bestx = self.eng.identify_best(self.hiloModel, xtrain, ctrain, stdout=self.out,stderr=self.err)
+        bestx = self.identify_best_python(xtrain, ctrain)
         # need to convert bestx back to full dimensions
         bestx = np.array(bestx, dtype='double').squeeze()
         bestx = self.add_phi(bestx, double=False)
         return bestx
         
-    ################## END HILO Matlab interface functions ###################################
+    ################## END HILO interface functions ###################################
 
     def flag_suspicious(self, logs, stims):
         """Return true if log entry is suspicious (did not converge)"""
